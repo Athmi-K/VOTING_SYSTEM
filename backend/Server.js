@@ -1,237 +1,221 @@
 // backend/index.js
-
 require('dotenv').config();
-
 const express = require('express');
-const cors = require('cors'); // Lets your React app talk to this server
-const jwt = require('jsonwebtoken'); // For creating secure tokens
-const randomstring = require('randomstring'); // For generating the OTP
-const pool = require('./db'); // Our updated database pool
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const randomstring = require('randomstring');
+const nodemailer = require('nodemailer'); // Import Nodemailer
+const pool = require('./db');
 
 const app = express();
 const port = 3001;
 
-// --- Config / Middleware ---
+app.use(cors());
+app.use(express.json());
 
-// This is a secret key for signing JWTs.
-// In a real app, you'd put this in a .env file!
-const JWT_SECRET = 'my-super-secret-key-for-voting-app';
-
-app.use(cors()); // Enable CORS for all routes
-app.use(express.json()); // Allow server to read JSON from request bodies
-
-// --- 1. Authentication Endpoints ---
-
-// POST /api/login
-// Action: Receives voter_id and email, sends an OTP
-app.post('/api/login', async (req, res) => {
-  const { voter_id, email } = req.body;
-  
-  try {
-    const user = await pool.query(
-      'SELECT * FROM Voter WHERE voter_id = $1 AND email = $2',
-      [voter_id, email]
-    );
-
-    if (user.rows.length === 0) {
-      return res.status(404).json({ message: 'Voter not found' });
-    }
-
-    // Generate a 6-digit numeric OTP
-    const otp = randomstring.generate({
-      length: 6,
-      charset: 'numeric',
-    });
-
-    // Set expiration time (e.g., 5 minutes from now)
-    const expires_at = new Date(Date.now() + 10 * 60 * 1000);
-
-    // Save OTP to the database
-    await pool.query(
-      'INSERT INTO OTP (voter_id, otp_code, expires_at) VALUES ($1, $2, $3)',
-      [voter_id, otp, expires_at]
-    );
-
-    // --- In a real project, you would email this OTP ---
-    console.log(`*** OTP for ${voter_id}: ${otp} ***`);
-    // --------------------------------------------------
-
-    res.json({ message: 'OTP has been sent (check console)' });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+// --- EMAIL CONFIGURATION ---
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
   }
 });
 
-// POST /api/verify
-// Action: Receives voter_id and OTP, sends back a JWT
-app.post('/api/verify', async (req, res) => {
-  const { voter_id, otp_code } = req.body;
-
-  try {
-    // Check for a valid, non-used, non-expired OTP
-    const result = await pool.query(
-      'SELECT * FROM OTP WHERE voter_id = $1 AND otp_code = $2 AND is_used = false AND expires_at > NOW()',
-      [voter_id, otp_code]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ message: 'Invalid or expired OTP' });
-    }
-
-    // Mark the OTP as used
-    const otp_id = result.rows[0].otp_id;
-    await pool.query('UPDATE OTP SET is_used = true WHERE otp_id = $1', [otp_id]);
-
-    // OTP is valid. Create a JWT.
-    const payload = {
-      voter: {
-        voter_id: voter_id,
-      },
-    };
-
-    // Sign the token to send to the user
-    const token = jwt.sign(payload, JWT_SECRET, {
-      expiresIn: '1h', // Token lasts for 1 hour
-    });
-
-    res.json({ message: 'Login successful', token: token });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
-  }
-});
-
-// --- 2. Authentication Middleware ---
-// This function protects our routes.
-// It checks for a valid JWT in the request header.
-
+// --- MIDDLEWARE ---
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // "Bearer TOKEN"
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token == null) return res.status(401).json({ message: 'No token provided' });
 
-  if (token == null) {
-    return res.status(401).json({ message: 'No token provided' }); // Unauthorized
-  }
-
-  // Verify the token
-  jwt.verify(token, JWT_SECRET, (err, voter) => {
-    if (err) {
-      return res.status(403).json({ message: 'Token is invalid' }); // Forbidden
-    }
-    
-    // Add the user payload to the request object
-    req.voter = voter; 
-    next(); // Move on to the next function (the route handler)
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Token is invalid' });
+    req.user = user;
+    next();
   });
 }
 
-// --- 3. Protected Endpoints (Voting) ---
+// ==========================
+// 🟢 USER (VOTER) MODULE
+// ==========================
 
-// GET /api/candidates
-// Action: (Requires valid token) Gets all candidates
-app.get('/api/candidates', authenticateToken, async (req, res) => {
+// 1. User Registration
+app.post('/api/user/register', async (req, res) => {
+  const { voter_id, name, email, phone } = req.body;
   try {
-    const { rows } = await pool.query(
-      'SELECT candidate_id, name, party FROM Candidate'
+    await pool.query(
+      'INSERT INTO Voter (voter_id, name, email, phone_number) VALUES ($1, $2, $3, $4)',
+      [voter_id, name, email, phone]
     );
-    res.json(rows);
+    res.json({ message: 'Registration successful! Please log in.' });
   } catch (err) {
-    console.error(err.message);
+    console.error(err);
+    res.status(500).json({ message: 'Error registering user. ID or Email may already exist.' });
+  }
+});
+
+// 2. User Login (Sends OTP via Gmail)
+app.post('/api/user/login', async (req, res) => {
+  const { voter_id, email } = req.body;
+  try {
+    console.log("LOGIN REQUEST:", voter_id, email);
+
+    const user = await pool.query('SELECT * FROM Voter WHERE voter_id = $1 AND email = $2', [voter_id, email]);
+    console.log("DB RESULT:", user.rows);
+
+    if (user.rows.length === 0) return res.status(404).json({ message: 'Voter not found' });
+
+    // Generate OTP
+    const otps= randomstring.generate({ length: 6, charset: 'numeric' });
+    const expires_at = new Date(Date.now() + 5 * 60 * 1000);
+    await pool.query('INSERT INTO OTP (voter_id, otp_code, expires_at) VALUES ($1, $2, $3)', [voter_id, otps, expires_at]);
+
+    // Send Email
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Your Voting OTP Code',
+      text: `Your OTP for login is: ${otps}. It expires in 5 minutes.`
+    };
+
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
+        console.log(error);
+        return res.status(500).json({ message: 'Error sending email' });
+      }
+      console.log('Email sent: ' + info.response);
+      res.json({ message: 'OTP sent to your email' });
+    });
+
+  } catch (err) {
+    console.error(err);
     res.status(500).send('Server error');
   }
 });
 
-// POST /api/vote
-// Action: (Requires valid token) Submits a vote
+// 3. Verify OTP
+app.post('/api/user/verify', async (req, res) => {
+  const { voter_id, otp_code } = req.body;
+  try {
+    const result = await pool.query(
+      'SELECT * FROM OTP WHERE voter_id = $1 AND otp_code = $2 AND is_used = false AND expires_at > NOW()', 
+      [voter_id, otp_code]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+    await pool.query('UPDATE OTP SET is_used = true WHERE otp_id = $1', [result.rows[0].otp_id]);
+    
+    // Token includes role: 'user'
+    const token = jwt.sign({ role: 'user', id: voter_id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    res.json({ message: 'Login successful', token, role: 'user' });
+  } catch (err) {
+    res.status(500).send('Server error');
+  }
+});
+
+// 4. Cast Vote (Checks if Election is Open first)
 app.post('/api/vote', authenticateToken, async (req, res) => {
   const { candidate_id } = req.body;
-  // Get voter_id from the token payload (added by our middleware)
-  const voter_id = req.voter.voter.voter_id;
-
-  // We MUST use a client from the pool for transactions
-  const client = await pool.connect();
+  const voter_id = req.user.id;
 
   try {
-    // Start the transaction
-    await client.query('BEGIN');
-
-    // 1. Check if the voter has already voted
-    const voterCheck = await client.query(
-      'SELECT has_voted FROM Voter WHERE voter_id = $1',
-      [voter_id]
-    );
-    
-    if (voterCheck.rows[0].has_voted) {
-      // If they have, stop the transaction
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'You have already voted' });
+    // Check Election Status
+    const status = await pool.query('SELECT is_open FROM ElectionSettings LIMIT 1');
+    if (!status.rows[0].is_open) {
+      return res.status(403).json({ message: 'Voting is currently CLOSED by the Admin.' });
     }
 
-    // 2. Mark the voter as 'voted'
-    await client.query(
-      'UPDATE Voter SET has_voted = true WHERE voter_id = $1',
-      [voter_id]
-    );
-
-    // 3. Increment the candidate's vote count
-    await client.query(
-      'UPDATE Candidate SET vote_count = vote_count + 1 WHERE candidate_id = $1',
-      [candidate_id]
-    );
-    
-    // 4. (Optional but good) Log the vote in the Vote table
-    await client.query(
-      'INSERT INTO Vote (voter_id, candidate_id) VALUES ($1, $2)',
-      [voter_id, candidate_id]
-    );
-
-    // 4. If all queries succeed, commit the transaction
-    await client.query('COMMIT');
+    await pool.query('CALL cast_vote($1, $2)', [voter_id, candidate_id]);
     res.json({ message: 'Vote cast successfully' });
-
   } catch (err) {
-    // 5. If any query fails, roll back all changes
-    await client.query('ROLLBACK');
-    console.error(err.message);
-    res.status(500).send('Server error during transaction');
-  } finally {
-    // 6. ALWAYS release the client back to the pool
-    client.release();
+   
+    console.error("VOTE ERROR =>", err);   // <-- add this
+    res.status(500).json({ message: err.message });
   }
 });
 
+// ==========================
+// 🔴 ADMINISTRATOR MODULE
+// ==========================
 
-// --- 4. Public Endpoint (Results) ---
-
-// GET /api/results
-// Action: Gets the final results
-app.get('/api/results', async (req, res) => {
-  
-  // --- Result Locking Logic ---
-  // We can hardcode an election end time for this project.
-  // Let's set it to a future date (e.g., Dec 1, 2025)
-  const electionEndTime = new Date('2025-12-01T17:00:00Z');
-  
-  if (Date.now() < electionEndTime) {
-    return res.status(403).json({ 
-      message: 'Results are locked until the election period ends.' 
-    });
-  }
-  // -----------------------------
-  
+// 1. Admin Login
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body;
+  // In a real app, hash passwords! For this mini-project, plain text check is okay if pre-seeded.
   try {
-    const { rows } = await pool.query(
-      'SELECT name, party, vote_count FROM Candidate ORDER BY vote_count DESC'
-    );
-    res.json(rows);
+    const admin = await pool.query('SELECT * FROM Administrator WHERE username = $1 AND password_hash = $2', [username, password]);
+    if (admin.rows.length === 0) return res.status(401).json({ message: 'Invalid credentials' });
+
+    const token = jwt.sign({ role: 'admin', id: admin.rows[0].admin_id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    res.json({ message: 'Admin Login successful', token, role: 'admin' });
   } catch (err) {
-    console.error(err.message);
     res.status(500).send('Server error');
   }
 });
 
-// --- Start The Server ---
+// 2. Add Candidate
+app.post('/api/admin/add-candidate', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.sendStatus(403);
+  const { name, party } = req.body;
+  try {
+    await pool.query('INSERT INTO Candidate (name, party) VALUES ($1, $2)', [name, party]);
+    res.json({ message: 'Candidate added' });
+  } catch (err) {
+    res.status(500).send('Error adding candidate');
+  }
+});
+
+// 3. Toggle Voting Status
+app.post('/api/admin/toggle-voting', authenticateToken, async (req, res) => {
+  console.log("🔥 /api/admin/toggle-voting CALLED");
+  console.log("USER:", req.user);
+
+  if (req.user.role !== 'admin') return res.sendStatus(403);
+
+  try {
+    const update = await pool.query('UPDATE ElectionSettings SET is_open = NOT is_open');
+    const newState = await pool.query('SELECT is_open FROM electionsettings LIMIT 1');
+
+    console.log("DB RESPONSE:", newState.rows);
+
+    res.json({ message: 'Status updated', is_open: newState.rows[0].is_open });
+  } catch (err) {
+    console.error("❌ ERROR IN toggle-voting:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// 4. Get Election Status & Results
+app.get('/api/admin/dashboard-data', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.sendStatus(403);
+  try {
+    const status = await pool.query('SELECT is_open FROM ElectionSettings LIMIT 1');
+    const results = await pool.query('SELECT name, party, vote_count FROM Candidate ORDER BY vote_count DESC');
+    
+    res.json({ 
+      is_open: status.rows[0].is_open,
+      results: results.rows 
+    });
+  } catch (err) {
+    res.status(500).send('Error fetching data');
+  }
+});
+
+// Helper: Public endpoint to check candidates (for User Dashboard)
+app.get('/api/candidates', authenticateToken, async (req, res) => {
+  try {
+    console.log("AUTH HEADER:", req.headers.authorization); // <--- Log here
+
+    const { rows } = await pool.query('SELECT candidate_id, name, party FROM Candidate');
+    res.json(rows);
+
+  } catch (err) {
+    res.status(500).send('Error');
+  }
+});
+
+
 app.listen(port, () => {
-  console.log(`Back-end server listening on http://localhost:${port}`);
+  console.log(`Server running on http://localhost:${port}`);
 });
